@@ -1,11 +1,9 @@
 const chains = require('./chains');
 const { ethers } = require("ethers");
 const service = require('./service');
-const fs = require('fs');
-const path = require('path');
 const readline = require('readline');
 const etc = chains.utils.etc;
-
+require('dotenv').config();
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -16,95 +14,108 @@ function askQuestion(query) {
   return new Promise(resolve => rl.question(query, resolve));
 }
 
-async function selectWallets(wallets) {
-  console.log("Choose wallets to use:");
-  console.log(`[0] All wallets`);
-  wallets.forEach((w, idx) => {
-    console.log(`[${idx + 1}] ${w.name}`);
-  });
-
-  let input = await askQuestion("Enter wallet numbers (comma-separated, e.g., 1,2 or 0 for all): ");
-  let indexes = input
-    .split(",")
-    .map(i => parseInt(i.trim()))
-    .filter(i => !isNaN(i) && i >= 0 && i <= wallets.length);
-
-  if (indexes.length === 0) {
-    console.log("Invalid input. Using first wallet.");
-    return [wallets[0]];
-  }
-
-  let selected = indexes.includes(0) ? wallets : indexes.map(i => wallets[i - 1]);
-  const validWallets = [];
-  for (const w of selected) {
+async function loadWalletsFromEnv() {
+  const wallets = [];
+  let i = 1;
+  
+  while (process.env[`PRIVATE_KEY_${i}`]) {
+    const privateKey = process.env[`PRIVATE_KEY_${i}`].trim();
     try {
-      new ethers.Wallet(w.privatekey);
-      validWallets.push(w);
-    } catch (err) {
-      console.error(`[${etc.timelog()}] Wallet "${w.name}" has invalid private key. Skipping.`);
+      const wallet = new ethers.Wallet(privateKey);
+      wallets.push({
+        name: process.env[`WALLET_NAME_${i}`] || `Wallet ${i}`,
+        privatekey: privateKey,
+        address: wallet.address // Pre-compute address
+      });
+    } catch (e) {
+      console.error(`[!] Invalid private key for WALLET_NAME_${i}`);
     }
+    i++;
   }
 
-  if (validWallets.length === 0) {
-    console.error(`[${etc.timelog()}] No valid wallets found. Exiting.`);
+  if (wallets.length === 0) {
+    console.error("[!] No valid wallets found in .env file");
     process.exit(1);
   }
 
-  return validWallets;
+  return wallets;
 }
 
-async function askMaxTransaction() {
-  let input = await askQuestion('Enter number of transactions (default 1 if empty or 0): ');
-  let value = parseInt(input);
-  return isNaN(value) || value <= 0 ? 1 : value;
+async function selectWalletsInteractive(wallets) {
+  console.log("\nAvailable Wallets:");
+  console.log(`[0] All wallets (${wallets.length})`);
+  wallets.forEach((w, idx) => {
+    console.log(`[${idx + 1}] ${w.name} (${w.address})`);
+  });
+
+  const input = await askQuestion("Select wallets (comma separated, 0 for all): ");
+  const selections = new Set(
+    input.split(',')
+      .map(x => parseInt(x.trim()))
+      .filter(x => !isNaN(x) && x >= 0 && x <= wallets.length)
+  );
+
+  if (selections.has(0)) return wallets;
+  return wallets.filter((_, index) => selections.has(index + 1));
+}
+
+async function askMaxTransactions() {
+  const input = await askQuestion('Number of transactions per wallet (default 1): ');
+  const value = parseInt(input) || 1;
+  return Math.max(1, value);
 }
 
 async function selectTransactionType() {
-  const types = {
+  const TRANSACTION_TYPES = {
     1: { label: "Sepolia → Babylon", method: service.sepoliaBabylon },
-    2: { label: "Sepolia → Holesky", method: service.sepoliaHolesky },
-    0: { label: "All", method: null }
+    2: { label: "Sepolia → Holesky", method: service.sepoliaHolesky }
   };
 
-  console.log("Choose transaction type:");
-  Object.entries(types).forEach(([key, val]) => {
+  console.log("\nAvailable Transactions:");
+  Object.entries(TRANSACTION_TYPES).forEach(([key, val]) => {
     console.log(`[${key}] ${val.label}`);
   });
+  console.log(`[0] All transactions`);
 
-  let input = await askQuestion("Enter number of transaction type (e.g., 1 or 0 for all): ");
+  const input = await askQuestion("Select transaction type: ");
   const choice = parseInt(input);
-  if (isNaN(choice) || !types[choice]) {
-    console.log("Invalid input. Using default (Holesky → Babylon).");
-    return [types[1]];
-  }
 
-  return choice === 0 ? Object.values(types).filter(t => t.method !== null) : [types[choice]];
+  if (choice === 0) return Object.values(TRANSACTION_TYPES);
+  return TRANSACTION_TYPES[choice] ? [TRANSACTION_TYPES[choice]] : [TRANSACTION_TYPES[1]]; // Default to first option
 }
 
-async function runTransactionParallel() {
+async function main() {
   etc.header();
-
-  const walletData = JSON.parse(fs.readFileSync(path.join(__dirname, "./wallet.json"), "utf8"));
-  const wallets = walletData.wallets;
-
-  const selectedWallets = await selectWallets(wallets);
+  
+  // Load and validate wallets
+  const wallets = await loadWalletsFromEnv();
+  
+  // Interactive selection
+  const selectedWallets = await selectWalletsInteractive(wallets);
   global.selectedWallets = selectedWallets;
 
-  const maxTransaction = await askMaxTransaction();
-  global.maxTransaction = maxTransaction;
+  console.log("\n✅ Selected Wallets:");
+  console.table(selectedWallets.map(w => ({
+    Name: w.name,
+    Address: w.address,
+    'Key Preview': `${w.privatekey.slice(0, 6)}...${w.privatekey.slice(-4)}`
+  })));
 
-  const transactionTypes = await selectTransactionType();
+  // Get transaction parameters
+  global.maxTransaction = await askMaxTransactions();
+  const transactions = await selectTransactionType();
 
   rl.close();
 
-  for (const tx of transactionTypes) {
-    console.log(`[${etc.timelog()}] Executing transaction: ${tx.label}`);
+  // Execute transactions
+  for (const tx of transactions) {
+    console.log(`\n🚀 Starting: ${tx.label}`);
     try {
       await tx.method();
     } catch (error) {
-      console.error(`[${etc.timelog()}] Error in ${tx.label}: ${error.message}`);
+      console.error(`[${etc.timelog()}] FAILED: ${error.message}`);
     }
   }
 }
 
-runTransactionParallel();
+main().catch(console.error);
